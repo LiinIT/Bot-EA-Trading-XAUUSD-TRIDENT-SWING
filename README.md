@@ -57,7 +57,85 @@ Mỗi $1 giá với 3 × 0.01 lot = **$3**. EA **bỏ qua setup** nếu rủi ro
 | $10 | $30 | **$1,000** | $3,000 |
 | $20 | $60 | **$2,000** | $6,000 |
 
-👉 Với vốn **dưới ~$500**, phần lớn setup trên M15/H1 sẽ bị bỏ qua. Đây là cơ chế bảo vệ, không phải lỗi.
+👉 Với vốn **dưới ~$500**, phần lớn setup trên M15/H1 sẽ bị bỏ qua. Đây là cơ chế bảo vệ, không phải lỗi. Vốn nhỏ thì xem phần **tài khoản cent** bên dưới.
+
+---
+
+## 🧮 Công thức tự tính lot
+
+SL của mỗi setup đặt ở **đáy gần nhất (C) khi BUY** hoặc **đỉnh gần nhất (C) khi SELL**, cộng thêm buffer nếu có. EA tính lot sao cho **nếu cả 3 lệnh dính SL thì chỉ mất đúng số tiền bạn chọn**:
+
+```text
+  Khoảng SL      = | Entry − SL |                       (SL = đáy/đỉnh C ± buffer)
+  Lỗ / 1 lot     = Khoảng SL × Contract Size × giá trị tick    (EA dùng OrderCalcProfit)
+  Tiền rủi ro    = Vốn × Risk %          (chế độ Rủi ro %)
+                 = số tiền cố định       (chế độ Rủi ro tiền)
+  Lot / lệnh     = làm tròn xuống ( Tiền rủi ro ÷ Lỗ 1 lot ÷ 3 )
+  Rủi ro thật    = Lot / lệnh × 3 × Lỗ 1 lot   → nếu > Max Risk % thì BỎ QUA setup
+```
+
+```mermaid
+flowchart LR
+    A["💼 Vốn<br/>Balance hoặc Equity"] --> B["× Risk %<br/>= Tiền rủi ro"]
+    C["📍 Entry − SL<br/>(SL tại đáy/đỉnh C)"] --> D["Lỗ của 1 lot<br/>(OrderCalcProfit)"]
+    B --> E["÷ Lỗ 1 lot ÷ 3"]
+    D --> E
+    E --> F["Làm tròn theo bước lot<br/>tối thiểu = lot min"]
+    F --> G{"Rủi ro thật ≤ Max Risk %?"}
+    G -- "Có" --> H["✅ Đặt 3 lệnh"]
+    G -- "Không" --> I["⛔ Bỏ qua setup"]
+```
+
+### Ba chế độ tính lot (`InpLotMode`)
+
+| Chế độ | Dùng khi | Tham số |
+|---|---|---|
+| **Rủi ro %** *(mặc định)* | Muốn lot tự lớn lên/nhỏ lại theo vốn (lãi kép) | `InpRiskPercent`, `InpCapitalBase` |
+| **Rủi ro tiền** | Muốn mỗi setup mất tối đa một số tiền cố định, ví dụ $10 hoặc 1,000 USC | `InpRiskMoney` |
+| **Lot cố định** | Muốn tự chọn lot; EA vẫn kiểm tra `InpMaxRiskPercent` | `InpFixedLot` |
+
+### Ví dụ (XAUUSD, 1 lot = 100 oz, BUY với SL cách Entry $4)
+
+| | Vốn $1,000 · Risk 1% | Vốn $5,000 · Risk 1% |
+|---|---|---|
+| Tiền rủi ro | $10 | $50 |
+| Lỗ / 1 lot | $4 × 100 = $400 | $400 |
+| Lot / lệnh (trước làm tròn) | 10 ÷ 400 ÷ 3 = 0.008 | 50 ÷ 400 ÷ 3 = 0.042 |
+| Lot / lệnh (sau làm tròn) | **0.01** (nâng lên lot min) | **0.04** |
+| Rủi ro thật (3 lệnh) | $12 = **1.2%** ✅ (≤ 3%) | $48 = **0.96%** ✅ |
+
+Panel trên chart và tab Experts hiện đầy đủ phép tính mỗi lần đặt lệnh, ví dụ:
+`[TRIDENT] LOT = 50.00 / (400.00 x 3) -> 0.04/lenh | capital 5000.00, SL 4.00, risk 48.00 USD (0.96%)`
+
+---
+
+## 🪙 Gợi ý: chạy trên tài khoản **cent** để có lợi thế về vốn
+
+Ở tài khoản cent, số dư hiển thị bằng **cent (USC)**: nạp $50 thấy **5,000 USC**. Với phần lớn broker, **1 lot cent nhỏ hơn 100 lần** 1 lot standard, nên lot min 0.01 trên tài khoản cent chỉ rủi ro **1/100** so với tài khoản thường.
+
+👉 Vì EA tính lỗ bằng `OrderCalcProfit` (theo đơn vị tiền tài khoản), **công thức trên chạy đúng cho tài khoản cent mà không cần chỉnh gì.**
+
+### So sánh (XAUUSD, SL cách Entry $5, 3 lệnh lot min 0.01)
+
+| | Standard | **Cent** |
+|---|---|---|
+| Lỗ khi dính SL (lot min) | $15 | 15 USC = **$0.15** |
+| Vốn tối thiểu để EA vào lệnh (giới hạn 3%) | $500 | 500 USC = **$5** |
+| Vốn để đúng rủi ro 1% | $1,500 | 1,500 USC = **$15** |
+| Với $50 thật | Bỏ qua gần hết setup | Chạy **đúng 1%/setup**, lot tự tăng theo vốn |
+
+### Lợi thế
+- **Vốn nhỏ vẫn quản lý rủi ro chuẩn**: $20–$100 đã chạy được đúng 1%, thay vì bị làm tròn lên lot min rồi rủi ro 5–10%.
+- **Lãi kép mượt hơn**: bước lot nhỏ gấp 100 lần nên lot tăng theo vốn từng chút một.
+- **Chạy thật với tiền thật nhỏ**: kiểm chứng EA trên thị trường thật (trượt giá, spread thật) trước khi lên tài khoản standard.
+
+### Lưu ý khi dùng cent
+- ⚠️ Cent giúp **chia nhỏ rủi ro**, **không** làm tăng lợi nhuận: 1% của $50 vẫn là $0.50.
+- Chọn tài khoản cent **MT5 hedging** (một số broker mặc định netting, EA sẽ không chạy).
+- Symbol thường có **hậu tố**, ví dụ `XAUUSDc`. Gắn EA vào đúng chart symbol cent.
+- Kiểm tra **Symbol Specification** (Contract size, Volume min/step/max). Mỗi broker quy định khác nhau.
+- Tài khoản cent hay có **spread/phí cao hơn** và **giới hạn số dư hoặc lot tối đa**. Backtest với spread thật của broker.
+- Gợi ý cài đặt: `InpLotMode = Rủi ro %`, `InpRiskPercent = 1–2`, `InpMaxRiskPercent = 3`, `InpCapitalBase = Balance`.
 
 ---
 
@@ -195,7 +273,7 @@ Mỗi lệnh chiếm 1/3 khối lượng:
 | Nâng cấp | Lợi ích |
 |---|---|
 | **Tự giao dịch** bằng 3 lệnh Stop đặt sẵn, mỗi lệnh một TP | Không cần ngồi canh chart, chốt lời từng phần tự động |
-| **Khối lượng theo % vốn**, tính bằng `OrderCalcProfit` | Rủi ro mỗi setup luôn đúng X% vốn, không phụ thuộc độ rộng SL |
+| **Tự tính lot theo vốn và SL tại đáy/đỉnh C**: 3 chế độ Rủi ro % / Rủi ro tiền / Lot cố định, dùng `OrderCalcProfit` | Rủi ro mỗi setup luôn đúng mức chọn, không phụ thuộc độ rộng SL, chạy đúng cả trên tài khoản cent |
 | **Chặn rủi ro tối đa và kiểm tra margin** | Không vào lệnh nếu lot tối thiểu vẫn quá rủi ro hoặc không đủ ký quỹ |
 | **Khôi phục trạng thái** qua Global Variables | Khởi động lại MT5 hay đổi khung thời gian, EA vẫn nhận lại và quản lý lệnh cũ |
 | **Lọc spread và giờ rollover** | Tránh đặt lệnh lúc spread XAU giãn rộng |
@@ -234,8 +312,12 @@ Mỗi lệnh chiếm 1/3 khối lượng:
 | Entry/Exit | `InpStopBufferMode` | None | Buffer SL theo Points hoặc ATR (XAU nên dùng ATR 0.1–0.2) |
 | Entry/Exit | `InpExpiryBars` | 20 | Huỷ lệnh chờ sau N nến |
 | Entry/Exit | `InpUseBreakeven` | false | Dời SL về giá vào sau TP1 |
-| Risk | `InpRiskPercent` | 1.0 | % balance rủi ro cho cả 3 lệnh |
-| Risk | `InpMaxRiskPercent` | 3.0 | Bỏ qua setup nếu lot min vượt mức này |
+| Risk | `InpLotMode` | Rủi ro % | Cách tính lot: Rủi ro % / Rủi ro tiền / Lot cố định |
+| Risk | `InpCapitalBase` | Balance | Vốn dùng để tính: Balance hoặc Equity |
+| Risk | `InpRiskPercent` | 1.0 | [Rủi ro %] % vốn rủi ro cho cả 3 lệnh |
+| Risk | `InpRiskMoney` | 10.0 | [Rủi ro tiền] số tiền mỗi setup (tài khoản cent tính bằng USC) |
+| Risk | `InpFixedLot` | 0.01 | [Lot cố định] lot mỗi lệnh |
+| Risk | `InpMaxRiskPercent` | 3.0 | Rủi ro thật vượt mức này (% vốn) thì bỏ qua setup |
 | Risk | `InpMaxStopAtr` | 0 (tắt) | Bỏ qua sóng có SL > N × ATR |
 | Protection | `InpMaxSpreadPoints` | 0 (tắt) | Lọc spread |
 | Protection | `InpUseRolloverFilter` | true | Không đặt lệnh 23:50–01:10 giờ server |

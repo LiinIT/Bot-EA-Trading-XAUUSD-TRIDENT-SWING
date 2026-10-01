@@ -16,7 +16,7 @@
 //+------------------------------------------------------------------+
 #property copyright "EA (c) 2026 Ho Ngoc Khanh (LiinIT) | Logic: Trident Swing Projector (c) MarkitTick - CC BY-NC-SA 4.0"
 #property link      "https://github.com/LiinIT/Bot-EA-Trading-XAUUSD-TRIDENT-SWING"
-#property version   "1.00"
+#property version   "1.10"
 #property description "A-B-C swing pattern -> 3 pending Stop orders (TP1/TP2/TP3), SL beyond C."
 #property description "Requires a HEDGING account. Non-commercial use only (CC BY-NC-SA 4.0)."
 #property description "Donate coffee: 1907.5049.8560.17 / 68814062001 (Techcombank)"
@@ -40,6 +40,19 @@ enum ENUM_STOP_BUFFER
    BUFFER_NONE   = 0, // None
    BUFFER_POINTS = 1, // Points
    BUFFER_ATR    = 2  // ATR Fraction
+};
+
+enum ENUM_LOT_MODE
+{
+   LOT_RISK_PERCENT = 0, // Rủi ro % vốn
+   LOT_RISK_MONEY   = 1, // Rủi ro số tiền cố định
+   LOT_FIXED        = 2  // Lot cố định mỗi lệnh
+};
+
+enum ENUM_CAPITAL_BASE
+{
+   CAPITAL_BALANCE = 0, // Balance
+   CAPITAL_EQUITY  = 1  // Equity
 };
 
 enum ENUM_SETUP_STATE
@@ -76,10 +89,14 @@ input int              InpAtrLength         = 14;          // ATR Length
 input int              InpExpiryBars        = 20;          // Huỷ lệnh chờ sau N nến
 input bool             InpUseBreakeven      = false;       // Dời SL về giá vào sau khi chạm TP1
 
-input group "4. RISK"
-input double InpRiskPercent    = 1.0;  // Rủi ro mỗi setup (% balance, tổng 3 lệnh)
-input double InpMaxRiskPercent = 3.0;  // Rủi ro tối đa khi phải làm tròn lên lot min
-input double InpMaxStopAtr     = 0.0;  // Khoảng SL tối đa (bội số ATR, 0 = tắt)
+input group "4. RISK / LOT SIZE"
+input ENUM_LOT_MODE     InpLotMode        = LOT_RISK_PERCENT; // Cách tính lot
+input ENUM_CAPITAL_BASE InpCapitalBase    = CAPITAL_BALANCE;  // Vốn dùng để tính
+input double            InpRiskPercent    = 1.0;   // [Rủi ro %] % vốn mỗi setup (tổng 3 lệnh)
+input double            InpRiskMoney      = 10.0;  // [Rủi ro tiền] Số tiền mỗi setup (tiền tài khoản, cent = USC)
+input double            InpFixedLot       = 0.01;  // [Lot cố định] Lot mỗi lệnh
+input double            InpMaxRiskPercent = 3.0;   // Rủi ro tối đa (% vốn), vượt thì bỏ setup
+input double            InpMaxStopAtr     = 0.0;   // Khoảng SL tối đa (bội số ATR, 0 = tắt)
 
 input group "5. PROTECTION"
 input int    InpMaxSpreadPoints   = 0;        // Max Spread (points, 0 = tắt)
@@ -127,6 +144,18 @@ struct Setup
    double   tp3;
 };
 
+// Kết quả tính lot: vốn → số tiền rủi ro → khoảng SL → lot mỗi lệnh → rủi ro thực tế
+struct LotPlan
+{
+   double capital;
+   double riskTarget;
+   double stopDistance;
+   double lossPerLot;
+   double lotPerOrder;
+   double actualRisk;
+   double actualRiskPercent;
+};
+
 const double ENTRY_RATIO = 0.25;
 const double TP1_RATIO   = 0.50;
 const double TP2_RATIO   = 0.75;
@@ -145,7 +174,7 @@ int              g_atrHandle     = INVALID_HANDLE;
 int              g_adxHandle     = INVALID_HANDLE;
 int              g_rolloverStart = 0;
 int              g_rolloverEnd   = 0;
-double           g_lastRiskMoney = 0.0;
+LotPlan          g_lastLotPlan;
 string           g_lastNote      = "-";
 
 //━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -177,6 +206,7 @@ int OnInit()
 
    ZeroMemory(g_pivots);
    ZeroMemory(g_setup);
+   ZeroMemory(g_lastLotPlan);
    g_state       = STATE_NONE;
    g_armTime     = 0;
    g_lastBarTime = 0;
@@ -247,7 +277,8 @@ bool ValidateInputs()
    bool isValid = InpPivotLeft >= 1 && InpPivotRight >= 1 &&
                   InpMinPullback >= 0 && InpMaxPullback <= 100 && InpMinPullback <= InpMaxPullback &&
                   InpExpiryBars >= 1 && InpAtrLength >= 1 && InpAdxLength >= 1 &&
-                  InpRiskPercent > 0 && InpMaxRiskPercent >= InpRiskPercent &&
+                  InpRiskPercent > 0 && InpRiskMoney > 0 && InpFixedLot > 0 && InpMaxRiskPercent > 0 &&
+                  (InpLotMode != LOT_RISK_PERCENT || InpMaxRiskPercent >= InpRiskPercent) &&
                   InpWarmupBars >= 50 && g_rolloverStart >= 0 && g_rolloverEnd >= 0;
 
    if(!isValid)
@@ -563,7 +594,7 @@ void TryArmSetup(Setup &setup)
    PersistSetup();
    Note(StringFormat("ARMED %s entry=%s sl=%s tp3=%s lot=%.2fx%d risk=%.2f",
                      DirectionText(setup.dir), PriceText(setup.entry), PriceText(setup.stop),
-                     PriceText(setup.tp3), lot, TP_ORDER_COUNT, g_lastRiskMoney));
+                     PriceText(setup.tp3), lot, TP_ORDER_COUNT, g_lastLotPlan.actualRisk));
 }
 
 bool AreLevelsPlaceable(const Setup &setup)
@@ -590,6 +621,11 @@ bool AreLevelsPlaceable(const Setup &setup)
    return true;
 }
 
+// Công thức:
+//   lossPerLot  = tiền lỗ của 1.0 lot khi giá đi từ Entry tới SL (đáy/đỉnh C ± buffer)
+//   riskTarget  = vốn × Risk% | số tiền cố định
+//   lotPerOrder = làm tròn xuống theo bước lot ( riskTarget / lossPerLot / 3 )
+// OrderCalcProfit trả về tiền tài khoản (USD, USC...), nên công thức đúng cho cả tài khoản cent.
 bool CalcLotPerOrder(const Setup &setup, double &lot)
 {
    ENUM_ORDER_TYPE calcType = setup.dir == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
@@ -600,34 +636,57 @@ bool CalcLotPerOrder(const Setup &setup, double &lot)
       return false;
    }
 
-   double lossPerLot = -profitPerLot;
-   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskMoney  = balance * InpRiskPercent / 100.0;
-   double minLot     = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxLot     = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   LotPlan plan;
+   ZeroMemory(plan);
+   plan.capital      = CapitalForSizing();
+   plan.riskTarget   = RiskTargetMoney(plan.capital);
+   plan.stopDistance = MathAbs(setup.entry - setup.stop);
+   plan.lossPerLot   = -profitPerLot;
 
-   lot = FloorToLotStep(riskMoney / lossPerLot / TP_ORDER_COUNT);
-   lot = MathMin(MathMax(lot, minLot), maxLot);
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double rawLot = InpLotMode == LOT_FIXED ? InpFixedLot : plan.riskTarget / plan.lossPerLot / TP_ORDER_COUNT;
 
-   double actualRisk = lot * TP_ORDER_COUNT * lossPerLot;
-   double maxRisk    = balance * InpMaxRiskPercent / 100.0;
-   if(actualRisk > maxRisk)
+   plan.lotPerOrder       = MathMin(MathMax(FloorToLotStep(rawLot), minLot), maxLot);
+   plan.actualRisk        = plan.lotPerOrder * TP_ORDER_COUNT * plan.lossPerLot;
+   plan.actualRiskPercent = plan.capital > 0 ? plan.actualRisk / plan.capital * 100.0 : 0.0;
+   g_lastLotPlan = plan;
+
+   if(plan.actualRiskPercent > InpMaxRiskPercent)
    {
-      Note(StringFormat("Skip: risk %.2f > max %.2f (min lot %.2f x %d, SL %.2f)",
-                        actualRisk, maxRisk, minLot, TP_ORDER_COUNT, MathAbs(setup.entry - setup.stop)));
+      Note(StringFormat("Skip: risk %.2f (%.2f%%) > max %.2f%% | lot %.2f x %d, SL %.2f",
+                        plan.actualRisk, plan.actualRiskPercent, InpMaxRiskPercent,
+                        plan.lotPerOrder, TP_ORDER_COUNT, plan.stopDistance));
       return false;
    }
 
    double margin = 0.0;
-   if(OrderCalcMargin(calcType, _Symbol, lot * TP_ORDER_COUNT, setup.entry, margin) &&
+   if(OrderCalcMargin(calcType, _Symbol, plan.lotPerOrder * TP_ORDER_COUNT, setup.entry, margin) &&
       margin > AccountInfoDouble(ACCOUNT_MARGIN_FREE))
    {
       Note(StringFormat("Skip: margin %.2f > free margin %.2f", margin, AccountInfoDouble(ACCOUNT_MARGIN_FREE)));
       return false;
    }
 
-   g_lastRiskMoney = actualRisk;
+   PrintFormat("%s LOT = %.2f / (%.2f x %d) -> %.2f/lenh | capital %.2f, SL %.2f, risk %.2f %s (%.2f%%)",
+               LOG_TAG, plan.riskTarget, plan.lossPerLot, TP_ORDER_COUNT, plan.lotPerOrder, plan.capital,
+               plan.stopDistance, plan.actualRisk, AccountInfoString(ACCOUNT_CURRENCY), plan.actualRiskPercent);
+   lot = plan.lotPerOrder;
    return true;
+}
+
+double CapitalForSizing()
+{
+   if(InpCapitalBase == CAPITAL_EQUITY)
+      return AccountInfoDouble(ACCOUNT_EQUITY);
+   return AccountInfoDouble(ACCOUNT_BALANCE);
+}
+
+double RiskTargetMoney(const double capital)
+{
+   if(InpLotMode == LOT_RISK_MONEY)
+      return InpRiskMoney;
+   return capital * InpRiskPercent / 100.0;
 }
 
 bool PlacePendingOrders(const Setup &setup, const double lot)
@@ -944,6 +1003,15 @@ string DirectionText(const int dir)
    return "-";
 }
 
+string LotModeText()
+{
+   if(InpLotMode == LOT_RISK_MONEY)
+      return "RISK $";
+   if(InpLotMode == LOT_FIXED)
+      return "FIXED";
+   return "RISK %";
+}
+
 string StateText()
 {
    if(g_state == STATE_ARMED)
@@ -1034,7 +1102,9 @@ void UpdatePanel()
       "Entry    : %s\n"
       "SL       : %s\n"
       "TP1/2/3  : %s / %s / %s\n"
-      "Risk     : %.2f %s\n"
+      "Lot mode : %s | capital %.2f %s\n"
+      "Lot      : %.2f x %d | SL %.2f\n"
+      "Risk     : %.2f %s (%.2f%%)\n"
       "Pos/Ord  : %d / %d\n"
       "Spread   : %d pts\n"
       "Last     : %s",
@@ -1042,7 +1112,9 @@ void UpdatePanel()
       PriceText(g_setup.entry),
       PriceText(g_setup.stop),
       PriceText(g_setup.tp1), PriceText(g_setup.tp2), PriceText(g_setup.tp3),
-      g_lastRiskMoney, AccountInfoString(ACCOUNT_CURRENCY),
+      LotModeText(), CapitalForSizing(), AccountInfoString(ACCOUNT_CURRENCY),
+      g_lastLotPlan.lotPerOrder, TP_ORDER_COUNT, g_lastLotPlan.stopDistance,
+      g_lastLotPlan.actualRisk, AccountInfoString(ACCOUNT_CURRENCY), g_lastLotPlan.actualRiskPercent,
       CountOwnPositions(), CountOwnOrders(),
       (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD),
       g_lastNote));
